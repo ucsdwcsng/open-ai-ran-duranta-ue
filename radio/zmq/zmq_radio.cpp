@@ -73,8 +73,10 @@ static void tx_poll_thread(zmq_tx_channel *chan, size_t i, std::atomic<bool> *po
 
   while (*poll_thread_running) {
     if (reply_requested) {
+      // REP socket: no new request can arrive before we reply, so wait on the TX queue rather than the
+      // socket; polling the socket here slept the full timeout after the samples were already queued
       zmq_msg_t msg;
-      if (chan->pop_message(&msg)) {
+      if (chan->wait_message(&msg, std::chrono::milliseconds(10))) {
         int rc = zmq_msg_send(&msg, chan->socket_, 0);
         if (rc < 0) {
           LOG_E(HW, "[ZMQ] tx_poll_thread zmq_msg_send for TX antenna %d failed: %s\n", (int)i, zmq_strerror(errno));
@@ -82,6 +84,7 @@ static void tx_poll_thread(zmq_tx_channel *chan, size_t i, std::atomic<bool> *po
         zmq_msg_close(&msg);
         reply_requested = false;
       }
+      continue;
     }
 
     int rc = zmq_poll(&item, 1, 10); // 10ms timeout

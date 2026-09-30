@@ -9,6 +9,7 @@
 
 #include <zmq.h>
 #include "ring_buffer.h"
+#include <chrono>
 #include <condition_variable>
 #include <atomic>
 #include <mutex>
@@ -20,6 +21,7 @@ class zmq_tx_channel {
   void *socket_;
   std::queue<zmq_msg_t> queue_;
   std::mutex queue_mutex_;
+  std::condition_variable queue_cvar_;
   std::atomic<uint64_t> sample_count_ = 0;
   std::atomic<bool> is_tx_enabled_ = false;
   std::mutex transmit_alignment_mutex_;
@@ -40,6 +42,7 @@ class zmq_tx_channel {
 
   void transmit(c16_t *samples, size_t nsamps, uint64_t timestamp);
   bool pop_message(zmq_msg_t *msg);
+  bool wait_message(zmq_msg_t *msg, std::chrono::milliseconds timeout);
 
   void start(uint64_t init_time);
 
