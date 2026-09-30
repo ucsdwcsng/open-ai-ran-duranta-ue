@@ -36,6 +36,8 @@ void zmq_tx_channel::transmit(c16_t *samples, size_t nsamps, uint64_t timestamp)
                               reinterpret_cast<const int16_t *>(samples),
                               nsamps * 2,
                               c16_t_to_cf_t_factor);
+    if (chan_)
+      chan_->process(reinterpret_cast<chsim::cf *>(msg_data), total_samples, sample_count_ - zeros_to_push);
 
     {
       std::lock_guard<std::mutex> q_lock(queue_mutex_);

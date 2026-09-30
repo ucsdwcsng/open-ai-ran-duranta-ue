@@ -41,15 +41,19 @@
 #include <zmq.h>
 #include "zmq_imported.h"
 #include "zmq_simd.h"
+#include "chan_sim.h"
+#include <memory>
 
 #define ZMQ_SECTION "zmq"
 #define ZMQ_TX_CHANNELS "tx_channels"
 #define ZMQ_RX_CHANNELS "rx_channels"
+#define ZMQ_CHAN "chan"
 
 #define ZMQ_PARAMS_DESC                                                                                                            \
   {                                                                                                                                \
       STRINGLISTPARAM(ZMQ_TX_CHANNELS, "list of zmq addresses represeting tx channels_\n", PARAMFLAG_MANDATORY, nullptr, nullptr), \
       STRINGLISTPARAM(ZMQ_RX_CHANNELS, "list of zmq addresses represeting rx channels_\n", PARAMFLAG_MANDATORY, nullptr, nullptr), \
+      STRINGPARAM(ZMQ_CHAN, "mobility channel: distance=,speed=,min_distance=,max_distance=,dl_snr_ref=,ul_snr_ref=,ul_noise_dbfs=\n", 0, nullptr, ""), \
   };
 
 const size_t sample_size = sizeof(cf_t);
@@ -64,6 +68,7 @@ struct zmq_state_t {
   std::atomic<bool> poll_thread_running;
   bool stopped = false;
   double sample_rate;
+  std::unique_ptr<chsim::link> chan_dl, chan_ul;
 };
 
 static void tx_poll_thread(zmq_tx_channel *chan, size_t i, std::atomic<bool> *poll_thread_running)
@@ -113,8 +118,13 @@ static void tx_poll_thread(zmq_tx_channel *chan, size_t i, std::atomic<bool> *po
   }
 }
 
-static void rx_poll_thread(zmq_rx_channel *chan, size_t i, std::atomic<bool> *poll_thread_running)
+static void rx_poll_thread(zmq_rx_channel *chan,
+                           size_t i,
+                           std::atomic<bool> *poll_thread_running,
+                           chsim::link *ul,
+                           uint64_t log_every)
 {
+  uint64_t next_log = chan->rx_time_ + log_every;
   unsigned char *rx_buffer = static_cast<unsigned char *>(malloc(rx_buffer_size));
   c16_t *rx_buffer_c16 = static_cast<c16_t *>(malloc(rx_buffer_size / sizeof(cf_t) * sizeof(c16_t)));
   zmq_pollitem_t item = {chan->socket_, 0, ZMQ_POLLIN, 0};
@@ -145,6 +155,21 @@ static void rx_poll_thread(zmq_rx_channel *chan, size_t i, std::atomic<bool> *po
         }
         size_t num_samples_received = std::min(received_bytes, rx_buffer_size) / sizeof(cf_t);
         cf_t *samples = reinterpret_cast<cf_t *>(rx_buffer);
+        if (chan->chan_) {
+          chan->chan_->process(reinterpret_cast<chsim::cf *>(samples), num_samples_received, chan->rx_time_);
+          chan->rx_time_ += num_samples_received;
+          if (i == 0 && chan->rx_time_ >= next_log) {
+            next_log += log_every;
+            const auto &d = chan->chan_->st;
+            if (d.calibrated)
+              LOG_I(HW,
+                    "[ZMQ chan] d %.0f m, DL SNR %.1f dB (ref %.1f dBFS), UL gain %.1f dB\n",
+                    d.distance_m.load(), d.dl_snr_db.load(), d.ref_dbfs.load(),
+                    ul ? ul->st.ul_gain_db.load() : 0.0);
+            else
+              LOG_I(HW, "[ZMQ chan] d %.0f m, calibrating DL reference level\n", d.distance_m.load());
+          }
+        }
         convert_samples_avx512_rx(reinterpret_cast<const float *>(samples),
                                   reinterpret_cast<int16_t *>(rx_buffer_c16),
                                   num_samples_received * 2,
@@ -246,6 +271,7 @@ static int zmq_start(openair0_device_t *device)
   s->tx_stream.start(s->sample_rate / 100);
   for (size_t i = 0; i < s->rx_stream.channels_.size(); i++) {
     auto channel = s->rx_stream.channels_[i];
+    channel->rx_time_ = s->sample_rate / 100; // same origin as zmq_rx_stream's timestamps
     // Send initial request to start data flow
     char dummy = 0;
     if (zmq_send(channel->socket_, &dummy, 1, 0) != 1) {
@@ -258,7 +284,12 @@ static int zmq_start(openair0_device_t *device)
     s->tx_poll_threads.push_back(std::thread(tx_poll_thread, s->tx_stream.channels_[i], i, &s->poll_thread_running));
   }
   for (size_t i = 0; i < s->rx_stream.channels_.size(); ++i) {
-    s->rx_poll_threads.push_back(std::thread(rx_poll_thread, s->rx_stream.channels_[i], i, &s->poll_thread_running));
+    s->rx_poll_threads.push_back(std::thread(rx_poll_thread,
+                                             s->rx_stream.channels_[i],
+                                             i,
+                                             &s->poll_thread_running,
+                                             s->chan_ul.get(),
+                                             (uint64_t)s->sample_rate));
   }
   return 0;
 }
@@ -361,6 +392,22 @@ extern "C" __attribute__((__visibility__("default"))) int device_init(openair0_d
       zmq_state->rx_stream.channels_[i] = channel;
     }
     zmq_state->rx_stream.tx_stream_ = &zmq_state->tx_stream;
+  }
+
+  // Mobility channel (optional): distance -> path loss -> DL SNR and UL attenuation
+  const paramdef_t *chan_pd = gpd(param_desc, sizeofArray(param_desc), ZMQ_CHAN);
+  std::string chan_spec = (chan_pd && chan_pd->strptr && *chan_pd->strptr) ? *chan_pd->strptr : "";
+  if (!chan_spec.empty()) {
+    chsim::config ccfg;
+    std::string err = chsim::parse(chan_spec, ccfg);
+    AssertFatal(err.empty(), "[ZMQ] bad chan config: %s\n", err.c_str());
+    zmq_state->chan_dl = std::make_unique<chsim::link>(chsim::link::dir::dl, ccfg, openair0_cfg->sample_rate);
+    zmq_state->chan_ul = std::make_unique<chsim::link>(chsim::link::dir::ul, ccfg, openair0_cfg->sample_rate);
+    if (!zmq_state->rx_stream.channels_.empty())
+      zmq_state->rx_stream.channels_[0]->chan_ = zmq_state->chan_dl.get();
+    if (!zmq_state->tx_stream.channels_.empty())
+      zmq_state->tx_stream.channels_[0]->chan_ = zmq_state->chan_ul.get();
+    LOG_I(HW, "[ZMQ] mobility channel: %s\n", chsim::describe(ccfg).c_str());
   }
 
   device->trx_start_func = zmq_start;

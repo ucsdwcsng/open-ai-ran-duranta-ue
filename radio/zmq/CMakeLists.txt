@@ -2,7 +2,8 @@
 
 pkg_check_modules(zmq REQUIRED libzmq)
 add_library(ring_buffer ring_buffer.cpp)
-add_library(zmq_imported zmq_imported.cpp)
+add_library(zmq_imported zmq_imported.cpp chan_sim.cpp)
+set_target_properties(zmq_imported PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(zmq_imported PUBLIC ./)
 target_link_libraries(zmq_imported PUBLIC ${zmq_LIBRARIES} log_headers)
 

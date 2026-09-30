@@ -9,6 +9,7 @@
 
 #include <zmq.h>
 #include "ring_buffer.h"
+#include "chan_sim.h"
 #include <chrono>
 #include <condition_variable>
 #include <atomic>
@@ -26,6 +27,7 @@ class zmq_tx_channel {
   std::atomic<bool> is_tx_enabled_ = false;
   std::mutex transmit_alignment_mutex_;
   std::condition_variable transmit_alignment_cvar_;
+  chsim::link *chan_ = nullptr; // UL path loss, applied as samples are queued
 
   zmq_tx_channel(void *s, uint64_t buffer_size) : socket_(s)
   {
@@ -55,6 +57,8 @@ class zmq_rx_channel {
    overflow_buffer<c16_t> buffer_;
    bool request_sent_;
    std::atomic<bool> stopped_;
+   chsim::link *chan_ = nullptr; // DL noise, applied as samples arrive
+   uint64_t rx_time_ = 0;        // absolute sample time of the next received sample
    zmq_rx_channel(void *s, uint64_t buffer_size) : socket_(s), buffer_(buffer_size), stopped_(false)
   {
   }
