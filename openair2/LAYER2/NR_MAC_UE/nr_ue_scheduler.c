@@ -1846,8 +1846,16 @@ static void nr_ue_pucch_scheduler(NR_UE_MAC_INST_t *mac, frame_t frame, int slot
 
   // ACKNACK
   bool any_harq = get_downlink_ack(mac, frame, slot, &pucch[num_res]);
-  if (any_harq)
+  if (any_harq) {
+    // HARQ-ACK on pucch-ResourceCommon (e.g. for RRCSetup) has no dedicated resource to multiplex with:
+    // send it alone, as the gNB expects, and drop SR/CSI in this slot
+    if (!pucch[num_res].pucch_resource && num_res > 0) {
+      pucch[0] = pucch[num_res];
+      memset(&pucch[1], 0, num_res * sizeof(pucch[0]));
+      num_res = 0;
+    }
     num_res++;
+  }
 
   if (num_res == 0)
     return;
