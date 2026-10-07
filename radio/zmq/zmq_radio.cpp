@@ -43,6 +43,10 @@
 #include "zmq_simd.h"
 #include "chan_sim.h"
 #include <memory>
+#include <fstream>
+#include <map>
+#include <pthread.h>
+#include <sys/stat.h>
 
 #define ZMQ_SECTION "zmq"
 #define ZMQ_TX_CHANNELS "tx_channels"
@@ -53,7 +57,12 @@
   {                                                                                                                                \
       STRINGLISTPARAM(ZMQ_TX_CHANNELS, "list of zmq addresses represeting tx channels_\n", PARAMFLAG_MANDATORY, nullptr, nullptr), \
       STRINGLISTPARAM(ZMQ_RX_CHANNELS, "list of zmq addresses represeting rx channels_\n", PARAMFLAG_MANDATORY, nullptr, nullptr), \
-      STRINGPARAM(ZMQ_CHAN, "mobility channel: distance=,speed=,min_distance=,max_distance=,dl_snr_ref=,ul_snr_ref=,ul_noise_dbfs=\n", 0, nullptr, ""), \
+      STRINGPARAM(ZMQ_CHAN,                                                                                                        \
+                  "mobility channel / trace replay: distance=,speed=,min_distance=,max_distance=,dl_snr_ref=,ul_snr_ref=,"         \
+                  "ul_noise_dbfs=,dl_snr_min=,ul_snr_min=,jitter_db=,path_loss_exp=,seed=,trace_ctl=\n",                           \
+                  0,                                                                                                               \
+                  nullptr,                                                                                                         \
+                  ""),                                                                                                             \
   };
 
 const size_t sample_size = sizeof(cf_t);
@@ -68,7 +77,12 @@ struct zmq_state_t {
   std::atomic<bool> poll_thread_running;
   bool stopped = false;
   double sample_rate;
+  uint64_t origin = 0; // sample time of the stream start; air time counts from here
   std::unique_ptr<chsim::link> chan_dl, chan_ul;
+  std::shared_ptr<chsim::trace_source> traces; // set when trace_ctl= is given
+  std::string trace_ctl;
+  std::thread trace_thread;
+  std::atomic<bool> trace_thread_running{false};
 };
 
 static void tx_poll_thread(zmq_tx_channel *chan, size_t i, std::atomic<bool> *poll_thread_running)
@@ -118,6 +132,24 @@ static void tx_poll_thread(zmq_tx_channel *chan, size_t i, std::atomic<bool> *po
   }
 }
 
+// Once per second of air time: where the channel is now. Air time leads, for scripts that sync to it.
+static void log_chan(const chsim::link *dl, const chsim::link *ul)
+{
+  const auto &d = dl->st;
+  if (!d.calibrated) {
+    LOG_I(HW, "[ZMQ chan] t %.1f s, calibrating DL reference level\n", d.t_air.load());
+    return;
+  }
+  LOG_I(HW,
+        "[ZMQ chan] t %.1f s, %s, DL SNR %.1f dB (ref %.1f dBFS), UL SNR %.1f dB, UL gain %.1f dB\n",
+        d.t_air.load(),
+        dl->where().c_str(),
+        d.dl_snr_db.load(),
+        d.ref_dbfs.load(),
+        ul ? ul->st.ul_snr_db.load() : 0.0,
+        ul ? ul->st.ul_gain_db.load() : 0.0);
+}
+
 static void rx_poll_thread(zmq_rx_channel *chan,
                            size_t i,
                            std::atomic<bool> *poll_thread_running,
@@ -155,19 +187,13 @@ static void rx_poll_thread(zmq_rx_channel *chan,
         }
         size_t num_samples_received = std::min(received_bytes, rx_buffer_size) / sizeof(cf_t);
         cf_t *samples = reinterpret_cast<cf_t *>(rx_buffer);
+        bool log_now = false;
         if (chan->chan_) {
           chan->chan_->process(reinterpret_cast<chsim::cf *>(samples), num_samples_received, chan->rx_time_);
           chan->rx_time_ += num_samples_received;
           if (i == 0 && chan->rx_time_ >= next_log) {
             next_log += log_every;
-            const auto &d = chan->chan_->st;
-            if (d.calibrated)
-              LOG_I(HW,
-                    "[ZMQ chan] d %.0f m, DL SNR %.1f dB (ref %.1f dBFS), UL gain %.1f dB\n",
-                    d.distance_m.load(), d.dl_snr_db.load(), d.ref_dbfs.load(),
-                    ul ? ul->st.ul_gain_db.load() : 0.0);
-            else
-              LOG_I(HW, "[ZMQ chan] d %.0f m, calibrating DL reference level\n", d.distance_m.load());
+            log_now = true;
           }
         }
         convert_samples_avx512_rx(reinterpret_cast<const float *>(samples),
@@ -186,11 +212,102 @@ static void rx_poll_thread(zmq_rx_channel *chan,
         if (zmq_send(chan->socket_, &dummy, 1, 0) != 1) {
           LOG_E(HW, "[ZMQ] rx_poll_thread zmq_send for RX antenna %d failed: %s\n", (int)i, zmq_strerror(errno));
         }
+        // Logged once the next request is out, so it overlaps the broker round trip
+        if (log_now)
+          log_chan(chan->chan_, ul);
       }
     }
   }
   free(rx_buffer);
   free(rx_buffer_c16);
+}
+
+static bool same_file(const struct stat &a, const struct stat &b)
+{
+  return a.st_ino == b.st_ino && a.st_size == b.st_size && a.st_mtim.tv_sec == b.st_mtim.tv_sec
+         && a.st_mtim.tv_nsec == b.st_mtim.tv_nsec;
+}
+
+// Watches the trace control file and publishes what it asks for, from the air time it gives. All file
+// reading happens here, at normal priority, never on the SCHED_FIFO radio threads. A bad file is
+// logged and leaves the channel as it is.
+static void trace_ctl_thread(zmq_state_t *s)
+{
+  sched_param sp = {};
+  pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+  struct cached_trace {
+    struct stat st;
+    std::shared_ptr<const chsim::trace> tr;
+  };
+  std::map<std::string, cached_trace> cache;
+  struct stat seen = {};
+  bool have_seen = false;
+  while (s->trace_thread_running) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    struct stat cur;
+    if (stat(s->trace_ctl.c_str(), &cur) != 0 || (have_seen && same_file(cur, seen)))
+      continue;
+    seen = cur;
+    have_seen = true;
+    try {
+      std::ifstream f(s->trace_ctl);
+      std::stringstream text;
+      text << f.rdbuf();
+      chsim::ctl_cmd cmd;
+      std::string err = chsim::parse_ctl(text.str(), cmd);
+      if (!err.empty()) {
+        LOG_E(HW, "[ZMQ chan] %s: %s; channel unchanged\n", s->trace_ctl.c_str(), err.c_str());
+        continue;
+      }
+      std::shared_ptr<const chsim::trace> tr;
+      if (cmd.trace_path != "none") {
+        struct stat tst;
+        auto hit = cache.find(cmd.trace_path);
+        if (stat(cmd.trace_path.c_str(), &tst) != 0) {
+          LOG_E(HW, "[ZMQ chan] cannot read %s; channel unchanged\n", cmd.trace_path.c_str());
+          continue;
+        } else if (hit != cache.end() && same_file(hit->second.st, tst)) {
+          tr = hit->second.tr;
+        } else {
+          std::ifstream tf(cmd.trace_path);
+          auto t = std::make_shared<chsim::trace>();
+          err = chsim::load_trace(tf, *t);
+          if (!err.empty()) {
+            LOG_E(HW, "[ZMQ chan] %s: %s; channel unchanged\n", cmd.trace_path.c_str(), err.c_str());
+            continue;
+          }
+          const size_t slash = cmd.trace_path.find_last_of('/');
+          t->name = cmd.trace_path.substr(slash + 1, cmd.trace_path.find_last_of('.') - slash - 1);
+          tr = t;
+          cache[cmd.trace_path] = {tst, tr};
+        }
+      }
+      const double now = s->chan_dl->st.t_air;
+      s->traces->publish(tr, cmd.start, cmd.loop, now);
+      const std::string what =
+          tr ? "trace " + tr->name + " (" + std::to_string(tr->t.size()) + " rows, " + (cmd.loop ? "looping)" : "once)")
+             : std::string("base channel");
+      if (cmd.start >= now)
+        LOG_I(HW, "[ZMQ chan] %s from t %.1f s (set at t %.1f s)\n", what.c_str(), cmd.start, now);
+      else
+        LOG_W(HW,
+              "[ZMQ chan] %s from t %.1f s, set %.1f s late: playing in phase from now\n",
+              what.c_str(),
+              cmd.start,
+              now - cmd.start);
+    } catch (const std::exception &e) {
+      LOG_E(HW, "[ZMQ chan] trace control: %s; channel unchanged\n", e.what());
+    }
+  }
+}
+
+static void stop_trace_thread(zmq_state_t *s)
+{
+  if (s->trace_thread_running) {
+    s->trace_thread_running = false;
+    if (s->trace_thread.joinable())
+      s->trace_thread.join();
+  }
 }
 
 static int zmq_write(openair0_device_t *device, openair0_timestamp_t timestamp, void **buff, int nsamps, int cc, int flags)
@@ -231,6 +348,7 @@ static void zmq_end(openair0_device_t *device)
 {
   zmq_state_t *s = static_cast<zmq_state_t *>(device->priv);
   if (s) {
+    stop_trace_thread(s);
     if (s->poll_thread_running) {
       s->poll_thread_running = false;
       for (auto &t : s->tx_poll_threads) {
@@ -267,11 +385,11 @@ static void zmq_end(openair0_device_t *device)
 static int zmq_start(openair0_device_t *device)
 {
   zmq_state_t *s = static_cast<zmq_state_t *>(device->priv);
-  s->rx_stream.start(s->sample_rate / 100);
-  s->tx_stream.start(s->sample_rate / 100);
+  s->rx_stream.start(s->origin);
+  s->tx_stream.start(s->origin);
   for (size_t i = 0; i < s->rx_stream.channels_.size(); i++) {
     auto channel = s->rx_stream.channels_[i];
-    channel->rx_time_ = s->sample_rate / 100; // same origin as zmq_rx_stream's timestamps
+    channel->rx_time_ = s->origin; // same origin as zmq_rx_stream's timestamps
     // Send initial request to start data flow
     char dummy = 0;
     if (zmq_send(channel->socket_, &dummy, 1, 0) != 1) {
@@ -291,12 +409,17 @@ static int zmq_start(openair0_device_t *device)
                                              s->chan_ul.get(),
                                              (uint64_t)s->sample_rate));
   }
+  if (s->traces) {
+    s->trace_thread_running = true;
+    s->trace_thread = std::thread(trace_ctl_thread, s);
+  }
   return 0;
 }
 
 static int zmq_stop(openair0_device_t *device)
 {
   zmq_state_t *s = static_cast<zmq_state_t *>(device->priv);
+  stop_trace_thread(s);
   s->rx_stream.stop();
   // Stop and join the poll threads here so a stop->end sequence is idempotent:
   // zmq_end() skips its join block once poll_thread_running is false.
@@ -374,6 +497,7 @@ extern "C" __attribute__((__visibility__("default"))) int device_init(openair0_d
     }
   }
   zmq_state->sample_rate = openair0_cfg->sample_rate;
+  zmq_state->origin = (uint64_t)(openair0_cfg->sample_rate / 100);
 
   // Setup RX sockets (one per antenna)
   if (openair0_cfg->rx_num_channels > 0) {
@@ -394,15 +518,20 @@ extern "C" __attribute__((__visibility__("default"))) int device_init(openair0_d
     zmq_state->rx_stream.tx_stream_ = &zmq_state->tx_stream;
   }
 
-  // Mobility channel (optional): distance -> path loss -> DL SNR and UL attenuation
+  // Mobility channel (optional): distance -> path loss -> DL SNR and UL attenuation, or replayed traces
   const paramdef_t *chan_pd = gpd(param_desc, sizeofArray(param_desc), ZMQ_CHAN);
   std::string chan_spec = (chan_pd && chan_pd->strptr && *chan_pd->strptr) ? *chan_pd->strptr : "";
   if (!chan_spec.empty()) {
     chsim::config ccfg;
     std::string err = chsim::parse(chan_spec, ccfg);
     AssertFatal(err.empty(), "[ZMQ] bad chan config: %s\n", err.c_str());
-    zmq_state->chan_dl = std::make_unique<chsim::link>(chsim::link::dir::dl, ccfg, openair0_cfg->sample_rate);
-    zmq_state->chan_ul = std::make_unique<chsim::link>(chsim::link::dir::ul, ccfg, openair0_cfg->sample_rate);
+    if (!ccfg.trace_ctl.empty()) {
+      zmq_state->traces = std::make_shared<chsim::trace_source>();
+      zmq_state->trace_ctl = ccfg.trace_ctl;
+    }
+    const double fs = openair0_cfg->sample_rate;
+    zmq_state->chan_dl = std::make_unique<chsim::link>(chsim::link::dir::dl, ccfg, fs, zmq_state->origin, zmq_state->traces);
+    zmq_state->chan_ul = std::make_unique<chsim::link>(chsim::link::dir::ul, ccfg, fs, zmq_state->origin, zmq_state->traces);
     if (!zmq_state->rx_stream.channels_.empty())
       zmq_state->rx_stream.channels_[0]->chan_ = zmq_state->chan_dl.get();
     if (!zmq_state->tx_stream.channels_.empty())

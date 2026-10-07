@@ -13,8 +13,12 @@ UL     = transmit samples attenuated by the same amount, against the gNB noise f
 Both SNRs are floored (`dl_snr_min`, `ul_snr_min`) so distance can never walk a UE into radio link
 failure — this UE does not reconnect after an RRC release.
 
-Implemented in `radio/zmq/chan_sim.{h,cpp}`, ~230 lines. Hooks: DL in `rx_poll_thread`
-(`zmq_radio.cpp`), UL in `zmq_tx_channel::transmit` (`zmq_imported.cpp`).
+Instead of the model, a UE can also replay SNR traces and switch between them at run time
+([Trace replay](#trace-replay)).
+
+Implemented in `radio/zmq/chan_sim.{h,cpp}`, unit tests in `radio/zmq/tests/test_chan_sim.cpp`.
+Hooks: DL in `rx_poll_thread` (`zmq_radio.cpp`), UL in `zmq_tx_channel::transmit`
+(`zmq_imported.cpp`), the trace control thread in `zmq_radio.cpp`.
 
 ## Options
 
@@ -29,12 +33,14 @@ Passed as one comma-separated string: `--zmq.[0].chan "distance=50,speed=30,..."
 | `ul_snr_ref` | 25 | UL SNR in dB at the gNB at `distance` |
 | `ul_noise_dbfs` | unset | gNB noise floor the broker adds. **Unset leaves the UL untouched** |
 | `dl_snr_min` / `ul_snr_min` | 8 / 5 | SNR floors, dB |
-| `jitter_db` | 0 | slow random SNR offset (shadowing), rms dB, new value every 10 ms |
+| `jitter_db` | 0 | random SNR offset (shadowing), rms dB: a new independent value every 10 ms, interpolated between, the same in DL and UL |
 | `path_loss_exp` | 37.6 | dB per decade of distance |
-| `seed` | 0 | 0 = random |
+| `seed` | 0 | seeds the shadowing and the DL noise; the same seed gives the same channel |
+| `trace_ctl` | unset | control file for [trace replay](#trace-replay), an absolute path. Needs `ul_noise_dbfs` |
 
-`distance` must be inside `[min_distance, max_distance]`, and `max_distance > min_distance`, or the
-UE aborts at startup with `[ZMQ] bad chan config: ...` in its log.
+`distance` must be above 0 and, when bouncing, `max_distance` above `min_distance`, or the UE aborts
+at startup with `[ZMQ] bad chan config: ...` in its log. A starting distance outside the bounce
+range folds into it.
 
 ## Usage
 
@@ -60,18 +66,89 @@ sudo iperf3 -c 10.45.0.7 -b 0M -t 600 -i 1 &                      # UE1
 sudo iperf3 -c 10.45.0.8 -b 0M -t 600 -i 1 &                      # UE2
 ```
 
-Watch the channel (once per second per UE):
+Watch the channel (once per second of air time per UE):
 
 ```bash
 grep 'ZMQ chan' /tmp/oai_ues/ue1.log | tail -5
-#   [ZMQ chan] d 125 m, DL SNR 8.4 dB (ref -27.2 dBFS), UL gain -7.1 dB
+#   [ZMQ chan] t 125.0 s, d 125.0 m, DL SNR 8.4 dB (ref -27.2 dBFS), UL SNR 5.0 dB, UL gain -7.1 dB
 ```
+
+`t` is the air time (see [Trace replay](#trace-replay)); the model runs on it too.
 
 **Restart the gNB between runs.** Stopping the UEs leaves the gNB's UL socket waiting on a reply
 that never comes, which wedges its radio loop; the next UEs then fail to sync with no error.
 
 **The first ~1.5 s is calibration.** The log says `calibrating DL reference level` and no noise is
 applied until the reference is measured. Ignore metrics from that window.
+
+## Trace replay
+
+Instead of the model, a UE can replay SNR traces (DL and UL SNR over time), and switch to another
+trace at run time. Add `trace_ctl` to the spec, with `ul_noise_dbfs`, which it requires:
+
+```
+--zmq.[0].chan "dl_snr_ref=30,ul_snr_ref=30,seed=1,ul_noise_dbfs=-65,trace_ctl=/tmp/traces/ue1.ctl"
+```
+
+The model still runs as the **base channel**: it plays until a trace starts and again after
+`trace=none`.
+
+### Trace files
+
+CSV, one row per step:
+
+```
+t_s,dl_snr_db,ul_snr_db,d_m
+0,25.27,25.27,50.0
+0.01,25.14,25.14,50.0
+```
+
+- The header starts with `t_s,dl_snr_db,ul_snr_db`; further columns are ignored.
+- `t_s` starts at 0 and strictly increases. Row i holds from `t[i]` until `t[i+1]` (no
+  interpolation). A trace loops with a period of its last `t` plus its last step; a one-row trace
+  is a constant.
+- The SNRs apply as given: no floors. `jitter_db`, if set, adds on top.
+
+### The control file
+
+One per UE. A normal-priority thread polls it every 100 ms; file reading never runs on the radio
+threads. Replace the file whole (write a temp file, then `mv`) so the UE never reads half of one:
+
+```
+trace=/tmp/traces/trace_2.csv      # or trace=none: back to the base channel
+start=1234.5                       # air time, s, at which it takes over
+loop=1                             # 0: play once, then hold the last row
+```
+
+- When it changes, the UE loads the trace and logs
+  `[ZMQ chan] trace trace_2 (30000 rows, looping) from t 1234.5 s (set at t 1231.6 s)`.
+- The current channel plays until `start`. The new one then takes over on the same sample in both
+  directions, with no gap, starting from its row 0.
+- A `start` already past plays in phase with it (`set 1.2 s late` in the log).
+- A bad control or trace file is logged with `channel unchanged`, and the UE carries on.
+- With no control file the UE plays the base channel. Delete stale control files before starting a
+  UE, or it replays the last one.
+
+### Air time
+
+Air time is samples since the stream origin, over the sample rate. The DL and the UL run on it, and
+so does every UE behind a broker that starts all UEs on the same gNB sample (the C++ broker does).
+So one `start` written to several control files switches those UEs at the same instant, and UEs on
+the same trace see the same SNRs at the same time. The status line shows it first:
+
+```
+[ZMQ chan] t 1236.0 s, trace trace_2 row 150 (T 1234.5 s), DL SNR 21.3 dB (ref -27.3 dBFS), UL SNR 21.3 dB, UL gain 3.7 dB
+```
+
+### Limits
+
+- Keep both SNRs at 0 dB or above. This UE turns its measured SINR into CQI through an unsigned
+  conversion (`nr_csi_rs_cqi_estimation` in `csi_rx.c`): a negative SINR reports CQI 15, and 0 dB
+  reports CQI 0. A UE the gNB then releases does not come back.
+- The gNB adapts the DL from CSI every 20 ms (`csi_rs_period`). Faster changes show up as block
+  errors, not as CQI.
+- The UL SNR is against the broker's noise floor, so the broker must add `ul_noise_dbfs`, and any
+  broker UL gain shifts every UL value.
 
 ## Measured CQI vs SNR
 
@@ -124,9 +201,9 @@ loss, but it cannot follow `jitter_db` shadowing, which is what makes the block 
 ## Known limits
 
 - Single antenna (1x1) only.
-- `ul_snr_ref` is anchored by a one-time measurement of the UE's own transmit power, then path loss
-  is applied. The UE keeps running 3GPP power control underneath, so the level the gNB actually
-  receives drifts from the target. `dl_snr_ref` is exact; treat `ul_snr_ref` as a starting point.
+- The UL is scaled against a one-time measurement of the UE's transmit level. This UE writes its
+  samples at a fixed amplitude (3GPP power control does not scale them), so that reference holds and
+  the UL SNR at the broker's noise floor is what `ul_snr_ref` and the model (or a trace) ask for.
 - The gNB's reported `pusch_snr` reads a few dB below `ul_snr_ref` (~2.7 dB on this setup): it
   averages instantaneous dB values over a narrow, bursty PUSCH, and the UE's PUCCH lands ~4 dB above
   its PUSCH, so one UE-side anchor cannot match both.
