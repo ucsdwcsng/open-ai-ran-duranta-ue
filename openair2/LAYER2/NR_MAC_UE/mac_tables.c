@@ -247,8 +247,24 @@ static inline uint16_t packBits(const uint8_t *toPack, const int nb)
   return res;
 }
 
+#define ANT_ROWS(t) ((int)(sizeof(t) / sizeof((t)[0])))
+
 void set_antenna_port_parameters(fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch_pdu, int n_cw, long *max_length, long *dmrs, int ant)
 {
+  // The DCI antenna_ports field can hold values past the end of the table it indexes (reserved
+  // entries). A falsely detected DCI carries random bits, so bound the index and report 0 CDM groups,
+  // which the caller rejects as an invalid DCI instead of reading past the table.
+  int rows;
+  if (dmrs == NULL)
+    rows = max_length == NULL ? ANT_ROWS(table_7_3_2_3_3_1)
+                              : (n_cw == 2 ? ANT_ROWS(table_7_3_2_3_3_2_twoCodeword) : ANT_ROWS(table_7_3_2_3_3_2_oneCodeword));
+  else
+    rows = max_length == NULL ? (n_cw == 2 ? ANT_ROWS(table_7_3_2_3_3_3_twoCodeword) : ANT_ROWS(table_7_3_2_3_3_3_oneCodeword))
+                              : (n_cw == 2 ? ANT_ROWS(table_7_3_2_3_3_4_twoCodeword) : ANT_ROWS(table_7_3_2_3_3_4_oneCodeword));
+  if (ant < 0 || ant >= rows) {
+    dlsch_pdu->n_dmrs_cdm_groups = 0;
+    return;
+  }
   if (dmrs == NULL) {
     if (max_length == NULL) {
       // Table 7.3.1.2.2-1: Antenna port(s) (1000 + DMRS port), dmrs-Type=1, maxLength=1

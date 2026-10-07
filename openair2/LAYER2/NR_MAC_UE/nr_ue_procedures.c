@@ -619,7 +619,12 @@ static int nr_ue_process_dci_ul_01(NR_UE_MAC_INST_t *mac,
     csi_report = nr_ue_aperiodic_csi_reporting(mac, dci->csi_request, dci->time_domain_assignment.val, &csi_K2);
 
   /* SRS_REQUEST */
-  AssertFatal(dci->srs_request.nbits == 2, "If SUL is supported in the cell, there is an additional bit in SRS request field\n");
+  if (dci->srs_request.nbits != 2) {
+    // A genuine DCI always has the configured 2-bit field (3 only with SUL, unsupported); anything else
+    // is a falsely detected DCI parsed with the wrong layout. Drop it instead of asserting.
+    LOG_W(NR_MAC, "SRS request field of %d bits, likely due to unexpected DCI\n", dci->srs_request.nbits);
+    return -1;
+  }
   if (dci->srs_request.val > 0)
     nr_ue_aperiodic_srs_scheduling(mac, dci->srs_request.val, frame, slot);
 
@@ -1441,6 +1446,15 @@ static int nr_ue_process_dci_dl_11(NR_UE_MAC_INST_t *mac,
 
   dlsch_pdu->n_front_load_symb = 1; // default value
   set_antenna_port_parameters(dlsch_pdu, cw0 + cw1, max_length, dmrs_type, dci->antenna_ports.val);
+  if (dlsch_pdu->n_dmrs_cdm_groups < 1 || dlsch_pdu->n_dmrs_cdm_groups > 3) {
+    // Reserved or out-of-table antenna_ports: a falsely detected DCI. Drop it, as for an invalid MCS,
+    // instead of asserting later in nr_dlsch_extract_rbs().
+    LOG_W(NR_MAC,
+          "Invalid antenna_ports %d (%d CDM groups), likely due to unexpected DL DCI\n",
+          dci->antenna_ports.val,
+          dlsch_pdu->n_dmrs_cdm_groups);
+    return -1;
+  }
   int nb_re_dmrs = ((dmrs_type == NULL) ? 6 : 4) * dlsch_pdu->n_dmrs_cdm_groups;
 
   /* dmrs symbol positions*/
@@ -1561,7 +1575,12 @@ static int nr_ue_process_dci_dl_11(NR_UE_MAC_INST_t *mac,
   }
 
   /* SRS_REQUEST */
-  AssertFatal(dci->srs_request.nbits == 2, "If SUL is supported in the cell, there is an additional bit in SRS request field\n");
+  if (dci->srs_request.nbits != 2) {
+    // A genuine DCI always has the configured 2-bit field (3 only with SUL, unsupported); anything else
+    // is a falsely detected DCI parsed with the wrong layout. Drop it instead of asserting.
+    LOG_W(NR_MAC, "SRS request field of %d bits, likely due to unexpected DCI\n", dci->srs_request.nbits);
+    return -1;
+  }
   if (dci->srs_request.val > 0)
     nr_ue_aperiodic_srs_scheduling(mac, dci->srs_request.val, frame, slot);
   /* CBGTI */
